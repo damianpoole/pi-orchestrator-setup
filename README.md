@@ -42,9 +42,20 @@ Uninstall removes this setup's agents, package setting, managed routing block, a
 
 ## Design notes
 
-Astra performs the classification; `pi-subagents` supplies the execution mechanism. The setup does not force delegation for every request. Astra should delegate substantive work, keep final decision authority, and use one writer at a time when multiple agents could edit the same files.
+Astra performs the classification; `pi-subagents` supplies the execution mechanism. The primary must delegate every substantive implementation task to its matching role, including localized low-risk dependency updates. Conversational requests and read-only checks may stay with the primary; workers are not required to recursively delegate. Astra retains the current model, planning, coordination, verification, synthesis, user communication, and final decision authority. Keep one writer at a time when implementation could touch the same files.
 
 The model scope is strict, so accidental per-run model overrides outside this four-model policy are rejected. Change `config/settings.json` and reinstall if the policy changes.
+
+## Bounded assignments
+
+Keep delegated work practical and bounded:
+
+- Ask for one concrete outcome, naming the relevant files and working directory.
+- State explicit non-goals, proportionate validation, and the concise evidence expected back.
+- Reuse established facts. For a small request, avoid a full-repository audit or documentation rabbit hole.
+- Stop when acceptance is met; report blockers or unknowns instead of broadening scope. The primary should narrow or stop an overlong investigation rather than leave it running.
+
+For example: “In `/repo`, update `config/orchestrator-agents.md` to require primary delegation for substantive implementation; do not change installer code or other files; run `git diff --check` and report the diff summary and any uncertainty.”
 
 ## Sources
 
