@@ -4,8 +4,8 @@
   "defaultThinkingLevel": "low",
   "subagents": {
     "agentOverrides": {
-      "easy": { "model": "openai-codex/gpt-5.6-luna", "thinking": "high" },
-      "medium": { "model": "openai-codex/gpt-5.6-luna", "thinking": "max" },
+      "easy": { "model": "openai-codex/gpt-5.6-luna", "thinking": "medium" },
+      "medium": { "model": "openai-codex/gpt-5.6-luna", "thinking": "high" },
       "hard": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
       "very-hard": { "model": "openai-codex/gpt-6-astra", "thinking": "low" }
     },

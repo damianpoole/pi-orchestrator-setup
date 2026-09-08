@@ -1,30 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-AGENT_DIR="${PI_AGENT_DIR:-${HOME}/.pi/agent}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_DIR="${PI_AGENT_DIR:-${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}}"
 SETTINGS="${AGENT_DIR}/settings.json"
 AGENTS_FILE="${AGENT_DIR}/AGENTS.md"
 INSTALL_DIR="${AGENT_DIR}/agents/pi-orchestrator"
+CONFIG_DIR="${ROOT_DIR}/config"
 MARKER_START='<!-- pi-orchestrator-setup:start -->'
 MARKER_END='<!-- pi-orchestrator-setup:end -->'
 
 usage() {
-  printf 'Usage: %s [--dry-run] [--uninstall]\n' "$0"
+  printf 'Usage: %s [--provider openai-codex|github-copilot] [--dry-run] [--uninstall]\n' "$0"
+  printf '\n'
+  printf 'Install defaults to the openai-codex profile. Uninstall detects the active profile unless --provider is supplied.\n'
 }
+
 DRY_RUN=0
 UNINSTALL=0
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run) DRY_RUN=1 ;;
-    --uninstall) UNINSTALL=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *) printf 'Unknown option: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
+REQUESTED_PROVIDER=""
+PROVIDER_SEEN=0
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --provider)
+      if [[ "$#" -lt 2 || "$2" == --* ]]; then
+        printf '%s\n' '--provider requires a value.' >&2
+        usage >&2
+        exit 2
+      fi
+      if (( PROVIDER_SEEN )); then
+        printf '%s\n' '--provider may only be specified once.' >&2
+        usage >&2
+        exit 2
+      fi
+      REQUESTED_PROVIDER="$2"
+      PROVIDER_SEEN=1
+      shift 2
+      ;;
+    --provider=*)
+      if [[ -z "${1#*=}" ]]; then
+        printf '%s\n' '--provider requires a value.' >&2
+        usage >&2
+        exit 2
+      fi
+      if (( PROVIDER_SEEN )); then
+        printf '%s\n' '--provider may only be specified once.' >&2
+        usage >&2
+        exit 2
+      fi
+      REQUESTED_PROVIDER="${1#*=}"
+      PROVIDER_SEEN=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --uninstall)
+      UNINSTALL=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
   esac
 done
 
+case "$REQUESTED_PROVIDER" in
+  ""|openai-codex|github-copilot) ;;
+  *)
+    printf 'Invalid provider: %s (choose openai-codex or github-copilot).\n' "$REQUESTED_PROVIDER" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+case "$AGENT_DIR" in
+  ""|/)
+    printf 'Refusing to use an empty or root PI_AGENT_DIR.\n' >&2
+    exit 1
+    ;;
+esac
+
 run() {
-  if (( DRY_RUN )); then printf '+ %q' "$@"; printf '\n'; else "$@"; fi
+  if (( DRY_RUN )); then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
 }
 
 if ! command -v node >/dev/null 2>&1; then
@@ -42,73 +113,44 @@ if [[ "$UNINSTALL" -eq 0 ]]; then
     printf 'pi is required and must be on PATH.\n' >&2
     exit 1
   fi
-  run pi install npm:pi-subagents
+fi
+
+# Validate the selected profile and print a plan before any package/configuration work.
+if [[ "$UNINSTALL" -eq 0 ]]; then
+  node "$ROOT_DIR/install-config.js" --plan --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "${REQUESTED_PROVIDER:-openai-codex}"
+else
+  if [[ -n "$REQUESTED_PROVIDER" ]]; then
+    node "$ROOT_DIR/install-config.js" --plan --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "$REQUESTED_PROVIDER" --uninstall
+  else
+    node "$ROOT_DIR/install-config.js" --plan --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --uninstall
+  fi
+fi
+
+if [[ "$UNINSTALL" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+  # Capture settings/package ownership before pi can update settings.json.
+  node "$ROOT_DIR/install-config.js" --apply --quiet --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "${REQUESTED_PROVIDER:-openai-codex}"
+  run env PI_CODING_AGENT_DIR="$AGENT_DIR" pi install npm:pi-subagents
 fi
 
 if (( DRY_RUN )); then
-  printf '+ install configuration in %s\n' "$AGENT_DIR"
+  if [[ "$UNINSTALL" -eq 0 ]]; then
+    printf '+ env PI_CODING_AGENT_DIR=%q pi install npm:pi-subagents\n' "$AGENT_DIR"
+  fi
+  printf 'Dry run: no files will be changed.\n'
+  if [[ "$UNINSTALL" -eq 0 ]]; then
+    printf '+ write %s\n' "$SETTINGS"
+    printf '+ replace %s\n' "$INSTALL_DIR"
+    printf '+ update %s between managed markers\n' "$AGENTS_FILE"
+  else
+    printf '+ remove %s\n' "$INSTALL_DIR"
+    printf '+ remove managed settings from %s\n' "$SETTINGS"
+    printf '+ remove managed block from %s\n' "$AGENTS_FILE"
+  fi
   exit 0
 fi
 
-mkdir -p "$AGENT_DIR" "$AGENT_DIR/agents"
-
-node - "$SETTINGS" "$ROOT_DIR/config/settings.json" "$UNINSTALL" <<'NODE'
-const fs = require('node:fs');
-const path = process.argv[2];
-const sourcePath = process.argv[3];
-const uninstall = process.argv[4] === '1';
-const managed = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
-let settings = {};
-if (fs.existsSync(path)) {
-  const raw = fs.readFileSync(path, 'utf8').trim();
-  if (raw) settings = JSON.parse(raw);
-}
-const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-const roles = managed.subagents.agentOverrides;
-if (!uninstall) {
-  settings.defaultProvider = managed.defaultProvider;
-  settings.defaultModel = managed.defaultModel;
-  settings.defaultThinkingLevel = managed.defaultThinkingLevel;
-  settings.subagents ??= {};
-  settings.subagents.agentOverrides ??= {};
-  for (const [name, value] of Object.entries(roles)) settings.subagents.agentOverrides[name] = value;
-  settings.subagents.modelScope = managed.subagents.modelScope;
-  settings.subagents.maxSubagentDepth = managed.subagents.maxSubagentDepth;
-  settings.subagents.globalConcurrencyLimit = managed.subagents.globalConcurrencyLimit;
-  settings.subagents.maxSubagentSpawnsPerRun = managed.subagents.maxSubagentSpawnsPerRun;
-  settings.packages = Array.isArray(settings.packages) ? settings.packages : [];
-  if (!settings.packages.includes('npm:pi-subagents')) settings.packages.push('npm:pi-subagents');
-} else {
-  for (const [key, value] of Object.entries({
-    defaultProvider: managed.defaultProvider,
-    defaultModel: managed.defaultModel,
-    defaultThinkingLevel: managed.defaultThinkingLevel,
-  })) if (same(settings[key], value)) delete settings[key];
-  if (settings.subagents && typeof settings.subagents === 'object') {
-    if (settings.subagents.agentOverrides) {
-      for (const [name, value] of Object.entries(roles)) {
-        if (same(settings.subagents.agentOverrides[name], value)) delete settings.subagents.agentOverrides[name];
-      }
-      if (!Object.keys(settings.subagents.agentOverrides).length) delete settings.subagents.agentOverrides;
-    }
-    for (const [key, value] of Object.entries({
-      modelScope: managed.subagents.modelScope,
-      maxSubagentDepth: managed.subagents.maxSubagentDepth,
-      globalConcurrencyLimit: managed.subagents.globalConcurrencyLimit,
-      maxSubagentSpawnsPerRun: managed.subagents.maxSubagentSpawnsPerRun,
-    })) if (same(settings.subagents[key], value)) delete settings.subagents[key];
-    if (!Object.keys(settings.subagents).length) delete settings.subagents;
-  }
-  if (Array.isArray(settings.packages)) {
-    settings.packages = settings.packages.filter((entry) => entry !== 'npm:pi-subagents');
-    if (!settings.packages.length) delete settings.packages;
-  }
-}
-fs.mkdirSync(require('node:path').dirname(path), { recursive: true });
-fs.writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 });
-NODE
-
 if [[ "$UNINSTALL" -eq 0 ]]; then
+  mkdir -p "$AGENT_DIR" "$AGENT_DIR/agents"
   rm -rf "$INSTALL_DIR"
   mkdir -p "$INSTALL_DIR"
   cp "$ROOT_DIR/agents/"*.md "$INSTALL_DIR/"
@@ -116,15 +158,23 @@ if [[ "$UNINSTALL" -eq 0 ]]; then
 const fs = require('node:fs');
 const target = process.argv[2];
 const snippet = fs.readFileSync(process.argv[3], 'utf8').trim();
-let text = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '';
 const start = '<!-- pi-orchestrator-setup:start -->';
 const end = '<!-- pi-orchestrator-setup:end -->';
 const re = new RegExp(`${start}[\\s\\S]*?${end}\\n?`, 'm');
-text = re.test(text) ? text.replace(re, snippet + '\n') : (text.trimEnd() + (text.trim() ? '\n\n' : '') + snippet + '\n');
+const text = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '';
+const updated = re.test(text)
+  ? text.replace(re, snippet + '\n')
+  : (text.trimEnd() + (text.trim() ? '\n\n' : '') + snippet + '\n');
 fs.mkdirSync(require('node:path').dirname(target), { recursive: true });
-fs.writeFileSync(target, text, { mode: 0o600 });
+fs.writeFileSync(target, updated, { mode: 0o600 });
 NODE
 else
+  # Let the config helper inspect legacy setup files before removing them.
+  if [[ -n "$REQUESTED_PROVIDER" ]]; then
+    node "$ROOT_DIR/install-config.js" --apply --quiet --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "$REQUESTED_PROVIDER" --uninstall
+  else
+    node "$ROOT_DIR/install-config.js" --apply --quiet --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --uninstall
+  fi
   rm -rf "$INSTALL_DIR"
   node - "$AGENTS_FILE" <<'NODE'
 const fs = require('node:fs');
@@ -139,7 +189,11 @@ NODE
 fi
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
-  printf 'Pi orchestrator setup removed.\n'
+  if [[ -n "$REQUESTED_PROVIDER" ]]; then
+    printf 'Pi orchestrator setup removed (%s profile).\n' "$REQUESTED_PROVIDER"
+  else
+    printf 'Pi orchestrator setup removed (active profile).\n'
+  fi
 else
-  printf 'Pi orchestrator setup installed. Restart Pi or run /reload.\n'
+  printf 'Pi orchestrator setup installed (%s profile). Restart Pi or run /reload.\n' "${REQUESTED_PROVIDER:-openai-codex}"
 fi
