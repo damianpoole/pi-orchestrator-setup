@@ -4,10 +4,22 @@
   "defaultThinkingLevel": "low",
   "subagents": {
     "agentOverrides": {
-      "easy": { "model": "openai-codex/gpt-5.6-luna", "thinking": "medium" },
-      "medium": { "model": "openai-codex/gpt-5.6-luna", "thinking": "high" },
-      "hard": { "model": "openai-codex/gpt-5.6-sol", "thinking": "medium" },
-      "very-hard": { "model": "openai-codex/gpt-6-astra", "thinking": "low" }
+      "easy": {
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "medium"
+      },
+      "medium": {
+        "model": "openai-codex/gpt-5.6-luna",
+        "thinking": "high"
+      },
+      "hard": {
+        "model": "openai-codex/gpt-5.6-sol",
+        "thinking": "medium"
+      },
+      "very-hard": {
+        "model": "openai-codex/gpt-6-astra",
+        "thinking": "low"
+      }
     },
     "modelScope": {
       "enforce": true,
@@ -17,10 +29,9 @@
         "openai-codex/gpt-5.6-sol",
         "openai-codex/gpt-6-astra"
       ]
-    },
-    "maxSubagentDepth": 1,
-    "globalConcurrencyLimit": 4,
-    "maxSubagentSpawnsPerRun": 16
+    }
   },
-  "packages": ["npm:pi-subagents"]
+  "packages": [
+    "npm:pi-subagents@0.66.0"
+  ]
 }
