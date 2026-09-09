@@ -32,6 +32,7 @@
     }
   },
   "packages": [
-    "npm:pi-subagents@0.66.0"
+    "npm:pi-subagents@0.66.0",
+    "npm:@ff-labs/pi-fff@0.10.6"
   ]
 }

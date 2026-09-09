@@ -114,8 +114,13 @@ if [[ "$UNINSTALL" -eq 0 ]]; then
     printf 'Pi is required; set PI_BINARY to the pinned npm executable.\n' >&2
     exit 1
   }
-  node "$ROOT_DIR/check-runtime.js" "$PI_COMMAND"
-  PI_COMMAND="$(node -p 'require("node:fs").realpathSync(process.argv[1])' "$PI_COMMAND")"
+  if [[ -z "${PI_BINARY:-}" && "$PI_COMMAND" == */mise/shims/pi ]] && command -v mise >/dev/null 2>&1; then
+    MISE_PI_COMMAND="$(mise which pi 2>/dev/null || true)"
+    if [[ -n "$MISE_PI_COMMAND" ]]; then
+      PI_COMMAND="$MISE_PI_COMMAND"
+    fi
+  fi
+  PI_COMMAND="$(node "$ROOT_DIR/check-runtime.js" --resolve "$PI_COMMAND")"
 fi
 AGENT_DIR="$(node -p 'require("node:path").resolve(process.argv[1])' "$AGENT_DIR")"
 if [[ "$AGENT_DIR" == / ]]; then

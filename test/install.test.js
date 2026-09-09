@@ -88,7 +88,7 @@ test('new preferences and filtered packages deploy and removed declarations rest
   assert.deepEqual(read(f.settings).markdown, { mermaid: 'streaming', local: true });
   assert.deepEqual(read(f.settings).packages.find(p => typeof p === 'object'), extra);
   const calls = fs.readFileSync(f.log, 'utf8').trim().split('\n').map(JSON.parse);
-  assert.deepEqual(calls, [['install', 'npm:pi-subagents@0.66.0', '--no-approve'], ['install', 'npm:extra@2.0.0', '--no-approve']]);
+  assert.deepEqual(calls, [['install', 'npm:pi-subagents@0.66.0', '--no-approve'], ['install', 'npm:@ff-labs/pi-fff@0.10.6', '--no-approve'], ['install', 'npm:extra@2.0.0', '--no-approve']]);
   f.editProfile(p => { delete p.theme; delete p.markdown; p.packages = p.packages.slice(0, 1); });
   f.ok(); assert.equal(read(f.settings).theme, 'local');
   assert.deepEqual(read(f.settings).markdown, { mermaid: 'off', local: true });
@@ -117,7 +117,7 @@ test('version-one state migrates misplaced limits and retains original ownership
   write(path.join(f.agent, '.pi-orchestrator-setup.json'), { version: 1, provider: 'openai-codex', managed, previous, previousContainers: {}, packageAdded: 1 });
   f.ok(); assert.equal(read(f.settings).subagents.globalConcurrencyLimit, undefined);
   assert.equal(read(f.extension).globalConcurrencyLimit, 4);
-  assert.deepEqual(read(f.settings).packages, ['npm:pi-subagents@0.66.0']);
+  assert.deepEqual(read(f.settings).packages, ['npm:pi-subagents@0.66.0', 'npm:@ff-labs/pi-fff@0.10.6']);
   f.ok(['--uninstall']); assert.deepEqual(read(f.settings), { defaultModel: 'original-model' });
 });
 
