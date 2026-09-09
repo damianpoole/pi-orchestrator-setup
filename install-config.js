@@ -139,12 +139,6 @@ function pathKey(segments) {
   return segments.join('.');
 }
 
-function capturePaths(root, paths) {
-  const result = {};
-  for (const segments of paths) result[pathKey(segments)] = getEntry(root, segments);
-  return result;
-}
-
 function validProvider(provider) {
   return PROVIDERS.includes(provider);
 }
@@ -171,7 +165,7 @@ function parseArgs(argv) {
     } else if (arg.startsWith('--provider=')) {
       provider = arg.slice('--provider='.length);
       if (!provider) fail('--provider requires a value', 2);
-    } else if (arg === '--plan' || arg === '--apply') {
+    } else if (['--plan', '--apply', '--package-sources', '--restore-package-filters'].includes(arg)) {
       if (mode && mode !== arg.slice(2)) fail('choose exactly one of --plan or --apply', 2);
       mode = arg.slice(2);
     } else if (arg === '--uninstall') {
@@ -207,7 +201,7 @@ function loadProfiles(configDir) {
     if (profile.defaultProvider !== provider) {
       fail(`${profilePath(configDir, provider)} has defaultProvider ${JSON.stringify(profile.defaultProvider)}, expected ${provider}`);
     }
-    for (const segments of MANAGED_PATHS) {
+    for (const segments of MANAGED_PATHS.slice(0, -3)) {
       if (!getEntry(profile, segments).present) {
         fail(`${profilePath(configDir, provider)} is missing ${pathKey(segments)}`);
       }
@@ -215,6 +209,7 @@ function loadProfiles(configDir) {
     if (!isRecord(profile.subagents) || !Array.isArray(profile.subagents.modelScope.allow)) {
       fail(`${profilePath(configDir, provider)} has an invalid model scope`);
     }
+    validateProfile(profile);
     profiles[provider] = profile;
   }
   return profiles;
@@ -224,6 +219,10 @@ function loadState(statePath) {
   const loaded = readJson(statePath, 'installer state');
   if (!loaded.exists) return null;
   const state = loaded.value;
+  if (state.version === 2) {
+    if (!validProvider(state.provider) || !isRecord(state.documents) || !isRecord(state.packages)) fail('invalid version 2 installer state');
+    return state;
+  }
   if (state.version !== 1 || !validProvider(state.provider) || !isRecord(state.managed)
       || !isRecord(state.previous) || !isRecord(state.previousContainers)) {
     fail(`installer state is invalid; remove or repair ${statePath}`);
@@ -302,19 +301,6 @@ function restoreContainers(settings, previousContainers) {
   }
 }
 
-function makeLegacyPrevious(settings, profiles, activeProvider) {
-  const activeProfile = activeProvider ? profiles[activeProvider] : undefined;
-  const previous = {};
-  for (const segments of MANAGED_PATHS) {
-    const current = getEntry(settings, segments);
-    const expected = activeProfile && getEntry(activeProfile, segments);
-    previous[pathKey(segments)] = expected?.present && current.present && same(current.value, expected.value)
-      ? { present: false }
-      : current;
-  }
-  return previous;
-}
-
 function uninstallTarget(options, profiles, settings, state) {
   if (state) return options.provider || state.provider;
   if (!hasLegacyInstallMarker(options.agentDir)) return undefined;
@@ -352,107 +338,138 @@ function plan(options, profiles, settings, state) {
     return target;
   }
   console.log(profileSummary(provider, profiles[provider]).join('\n'));
-  console.log('Actions: install/update pi-subagents, settings, agents, and managed AGENTS.md block');
+  console.log(`Packages: ${profiles[provider].packages.map(packageSource).join(', ')}`);
+  console.log('Extension config: ' + path.join(options.agentDir, 'extensions/subagent/config.json'));
+  console.log('Actions: install pinned packages, merge shared settings and extension config, install agents and managed AGENTS.md block');
   return provider;
 }
 
-function applyInstall(options, profiles, settingsInfo, state, activeProvider) {
-  const profile = profiles[options.provider];
-  const settings = settingsInfo.value;
-  assertSettingsShape(settings);
-
-  let previous;
-  let previousContainers;
-  let packageAdded;
-  if (state) {
-    previous = state.previous;
-    previousContainers = state.previousContainers;
-    packageAdded = state.packageAdded;
-  } else {
-    previous = makeLegacyPrevious(settings, profiles, activeProvider);
-    previousContainers = capturePaths(settings, CONTAINER_PATHS);
-    const currentPackages = getEntry(settings, ['packages']);
-    packageAdded = currentPackages.present && currentPackages.value.includes(PACKAGE) ? 0 : 1;
+// Profiles own declared leaf values; arrays are replaced as a unit. Track the
+// previous values so removed declarations and uninstall can restore local state.
+function assertSafeKeys(value) {
+  if (!isRecord(value)) return;
+  for (const [key, child] of Object.entries(value)) {
+    if (['__proto__', 'constructor', 'prototype'].includes(key)) fail(`unsupported configuration key: ${key}`);
+    assertSafeKeys(child);
   }
-
-  for (const segments of MANAGED_PATHS) {
-    setPath(settings, segments, getEntry(profile, segments).value);
-  }
-
-  const packages = getEntry(settings, ['packages']);
-  if (!packages.present) setPath(settings, ['packages'], []);
-  const updatedPackages = getEntry(settings, ['packages']).value;
-  if (!updatedPackages.includes(PACKAGE)) {
-    updatedPackages.push(PACKAGE);
-    setPath(settings, ['packages'], updatedPackages);
-  }
-
-  writeJson(settingsInfo.path, settings);
-  writeJson(options.statePath, {
-    version: 1,
-    provider: options.provider,
-    managed: clone(profile),
-    previous: clone(previous),
-    previousContainers: clone(previousContainers),
-    packageAdded,
-  });
 }
 
-function applyUninstall(options, profiles, settingsInfo, state, target) {
-  const settings = settingsInfo.value;
-  if (!target) {
-    if (state) fs.unlinkSync(options.statePath);
-    return false;
-  }
-  assertSettingsShape(settings);
+function packageSource(entry) {
+  return typeof entry === 'string' ? entry : entry?.source;
+}
 
-  if (state) {
-    for (const segments of MANAGED_PATHS) {
-      const key = pathKey(segments);
-      const managed = getEntry(state.managed, segments);
-      const current = getEntry(settings, segments);
-      if (!managed.present || !current.present || !same(current.value, managed.value)) continue;
-      const previous = state.previous[key] || { present: false };
-      if (previous.present) setPath(settings, segments, previous.value);
-      else deletePath(settings, segments);
+function packageIdentity(entry) {
+  const source = packageSource(entry);
+  if (typeof source !== 'string') return undefined;
+  const npm = /^(?:npm:)?(@[^/]+\/[^@]+|[^@/:]+)(?:@.*)?$/.exec(source);
+  return npm ? `npm:${npm[1]}` : source;
+}
+
+function validateProfile(profile) {
+  assertSafeKeys(profile);
+  if (!Array.isArray(profile.packages)) fail('profile packages must be an array');
+  const seen = new Set();
+  for (const entry of profile.packages) {
+    const source = packageSource(entry);
+    if (typeof source !== 'string' || !/^npm:(?:@[^/\s]+\/)?[^@/\s]+@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(source)) {
+      fail('shared packages require exact npm versions (npm:name@1.2.3); unpinned, git and local sources are not supported');
     }
-    const packages = getEntry(settings, ['packages']);
-    if (state.packageAdded > 0 && packages.present) {
-      if (!Array.isArray(packages.value)) fail('settings.json has non-array packages; refusing to uninstall');
-      const updatedPackages = packages.value;
-      removePackageOccurrences(updatedPackages, state.packageAdded);
-      if (updatedPackages.length > 0) setPath(settings, ['packages'], updatedPackages);
-      else deletePath(settings, ['packages']);
-    }
-    restoreContainers(settings, state.previousContainers);
-  } else {
-    const profile = profiles[target];
-    let matched = 0;
-    for (const segments of MANAGED_PATHS) {
-      const expected = getEntry(profile, segments);
-      const current = getEntry(settings, segments);
-      if (expected.present && current.present && same(current.value, expected.value)) {
-        deletePath(settings, segments);
-        matched += 1;
-      }
-    }
-    const packages = getEntry(settings, ['packages']);
-    if (matched > 0 && packages.present && Array.isArray(packages.value)) {
-      removePackageOccurrences(packages.value, 1);
-      if (packages.value.length > 0) setPath(settings, ['packages'], packages.value);
-      else deletePath(settings, ['packages']);
-    }
-    for (const segments of [...CONTAINER_PATHS].reverse()) {
-      const current = getEntry(settings, segments);
-      if (current.present && isRecord(current.value) && Object.keys(current.value).length === 0) {
-        deletePath(settings, segments);
-      }
+    const identity = packageIdentity(entry);
+    if (seen.has(identity)) fail(`duplicate shared package: ${identity}`);
+    seen.add(identity);
+  }
+}
+
+function restoreDocument(value, state) {
+  if (!state) return;
+  for (const record of [...state.records].reverse()) {
+    if (!same(getEntry(value, record.path), record.after)) continue;
+    if (record.before.present) setPath(value, record.path, record.before.value);
+    else deletePath(value, record.path);
+  }
+  for (const record of [...state.containers].reverse()) {
+    const current = getEntry(value, record.path);
+    if (current.present && isRecord(current.value) && Object.keys(current.value).length === 0) {
+      if (record.before.present) setPath(value, record.path, record.before.value);
+      else deletePath(value, record.path);
     }
   }
+}
 
-  if (settingsInfo.exists && !same(settingsInfo.original, settings)) writeJson(settingsInfo.path, settings);
-  if (state) fs.unlinkSync(options.statePath);
-  return true;
+function mergeDocument(value, desired) {
+  const state = { records: [], containers: [] };
+  function visit(object, prefix = []) {
+    for (const [key, child] of Object.entries(object)) {
+      const segments = [...prefix, key];
+      const before = getEntry(value, segments);
+      if (isRecord(child) && Object.keys(child).length > 0) {
+        if (before.present && !isRecord(before.value)) fail(`cannot merge object into non-object ${segments.join('.')}`);
+        state.containers.push({ path: segments, before });
+        visit(child, segments);
+      } else {
+        setPath(value, segments, child);
+        state.records.push({ path: segments, before, after: getEntry(value, segments) });
+      }
+    }
+  }
+  visit(desired);
+  return state;
+}
+
+function restorePackages(settings, state) {
+  if (!state) return;
+  const current = settings.packages || [];
+  for (const record of state.records) {
+    const matches = current.filter((entry) => packageIdentity(entry) === record.identity);
+    if (!same(matches, record.after)) continue;
+    const index = current.findIndex((entry) => packageIdentity(entry) === record.identity);
+    for (let i = current.length - 1; i >= 0; i--) {
+      if (packageIdentity(current[i]) === record.identity) current.splice(i, 1);
+    }
+    current.splice(index < 0 ? current.length : index, 0, ...clone(record.before));
+  }
+  if (current.length || state.present) settings.packages = current;
+  else delete settings.packages;
+}
+
+function mergePackages(settings, desired) {
+  const state = { present: Object.hasOwn(settings, 'packages'), records: [] };
+  const current = settings.packages || [];
+  for (const entry of desired) {
+    const identity = packageIdentity(entry);
+    const before = current.filter((item) => packageIdentity(item) === identity);
+    const index = current.findIndex((item) => packageIdentity(item) === identity);
+    for (let i = current.length - 1; i >= 0; i--) {
+      if (packageIdentity(current[i]) === identity) current.splice(i, 1);
+    }
+    current.splice(index < 0 ? current.length : index, 0, clone(entry));
+    state.records.push({ identity, before: clone(before), after: [clone(entry)] });
+  }
+  if (current.length || state.present) settings.packages = current;
+  return state;
+}
+
+function migrateLegacy(settings, state, profiles, activeProvider) {
+  if (!state && !activeProvider) return;
+  const expected = state?.managed || profiles[activeProvider];
+  for (const segments of MANAGED_PATHS) {
+    const current = getEntry(settings, segments);
+    const managed = getEntry(expected, segments);
+    // Old profiles stored execution limits in settings instead of extension config.
+    const oldLimit = { maxSubagentDepth: 1, globalConcurrencyLimit: 4, maxSubagentSpawnsPerRun: 16 };
+    const after = managed.present ? managed : { present: true, value: oldLimit[segments[1]] };
+    if (!same(current, after)) continue;
+    const before = state?.previous[pathKey(segments)] || { present: false };
+    if (before.present) setPath(settings, segments, before.value);
+    else deletePath(settings, segments);
+  }
+  if (!state || state.packageAdded > 0) {
+    const packages = settings.packages || [];
+    removePackageOccurrences(packages, state?.packageAdded || 1);
+    if (packages.length) settings.packages = packages;
+    else delete settings.packages;
+  }
+  restoreContainers(settings, state?.previousContainers || {});
 }
 
 function main() {
@@ -461,28 +478,65 @@ function main() {
   options.configDir = path.resolve(options.configDir);
   options.settingsPath = path.join(options.agentDir, 'settings.json');
   options.statePath = path.join(options.agentDir, '.pi-orchestrator-setup.json');
-
+  const extensionPath = path.join(options.agentDir, 'extensions/subagent/config.json');
   const profiles = loadProfiles(options.configDir);
+  if (options.mode === 'package-sources') {
+    console.log(profiles[options.provider].packages.map(packageSource).join('\n'));
+    return;
+  }
   const settingsInfo = readJson(options.settingsPath, 'settings.json');
-  settingsInfo.path = options.settingsPath;
-  settingsInfo.original = clone(settingsInfo.value);
+  const extensionInfo = readJson(extensionPath, 'subagent config');
+  const settings = clone(settingsInfo.value);
+  const extension = clone(extensionInfo.value);
   const state = loadState(options.statePath);
-  assertSettingsShape(settingsInfo.value);
-  const activeProvider = state?.provider || detectProvider(settingsInfo.value, profiles, options.agentDir);
+  assertSettingsShape(settings);
+  assertSafeKeys(settings);
+  assertSafeKeys(extension);
+  const activeProvider = state?.provider || detectProvider(settings, profiles, options.agentDir);
   if (options.uninstall && state && options.provider && state.provider !== options.provider) {
-    fail(`provider ${options.provider} is not active (active provider is ${state.provider}); rerun uninstall without --provider or select ${state.provider}`);
+    fail(`provider ${options.provider} is not active (active provider is ${state.provider})`);
   }
-
-  const target = options.mode === 'plan' ? plan(options, profiles, settingsInfo, state) : (options.uninstall
-    ? uninstallTarget(options, profiles, settingsInfo, state)
-    : options.provider);
-  if (options.mode === 'plan') return;
-
-  if (options.uninstall) {
-    applyUninstall(options, profiles, settingsInfo, state, target);
+  if (options.mode === 'restore-package-filters') {
+    // pi install can normalize package entries; restore the selected filters
+    // without recapturing installer ownership or modifying unrelated settings.
+    mergePackages(settings, profiles[options.provider].packages);
+    writeJson(options.settingsPath, settings);
+    return;
+  }
+  if (state?.version === 2) {
+    restoreDocument(settings, state.documents.settings);
+    restoreDocument(extension, state.documents.extension);
+    restorePackages(settings, state.packages);
   } else {
-    applyInstall(options, profiles, settingsInfo, state, activeProvider);
+    migrateLegacy(settings, state, profiles, activeProvider);
   }
+  let nextState;
+  if (!options.uninstall) {
+    const desired = clone(profiles[options.provider]);
+    delete desired.packages;
+    const extensionDesired = readJson(path.join(options.configDir, 'subagents.json'), 'shared subagent config', { optional: false }).value;
+    assertSafeKeys(extensionDesired);
+    for (const key of ['maxSubagentDepth', 'globalConcurrencyLimit', 'maxSubagentSpawnsPerRun']) {
+      if (!Number.isSafeInteger(extensionDesired[key]) || extensionDesired[key] < 1) fail(`invalid subagent config ${key}`);
+    }
+    nextState = {
+      version: 2,
+      provider: options.provider,
+      documents: {
+        settings: mergeDocument(settings, desired),
+        extension: mergeDocument(extension, extensionDesired),
+      },
+      packages: mergePackages(settings, profiles[options.provider].packages),
+    };
+  }
+  if (options.mode === 'plan') {
+    plan(options, profiles, settingsInfo, state);
+    return;
+  }
+  if (!same(settingsInfo.value, settings)) writeJson(options.settingsPath, settings);
+  if (!same(extensionInfo.value, extension)) writeJson(extensionPath, extension);
+  if (nextState) writeJson(options.statePath, nextState);
+  else if (state) fs.unlinkSync(options.statePath);
 }
 
 try {

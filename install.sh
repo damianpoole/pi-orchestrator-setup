@@ -103,16 +103,24 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 node_major="$(node -p 'process.versions.node.split(".")[0]')"
-if (( node_major < 22 )); then
-  printf 'Node.js 22+ is required (found %s).\n' "$(node --version)" >&2
+node_minimum="$(node -p "require(process.argv[1]).nodeMinimumMajor" "$CONFIG_DIR/runtime.json")"
+if (( node_major < node_minimum )); then
+  printf 'Node.js %s+ is required (found %s).\n' "$node_minimum" "$(node --version)" >&2
   exit 1
 fi
 
 if [[ "$UNINSTALL" -eq 0 ]]; then
-  if ! command -v pi >/dev/null 2>&1; then
-    printf 'pi is required and must be on PATH.\n' >&2
+  PI_COMMAND="$(command -v "${PI_BINARY:-pi}")" || {
+    printf 'Pi is required; set PI_BINARY to the pinned npm executable.\n' >&2
     exit 1
-  fi
+  }
+  node "$ROOT_DIR/check-runtime.js" "$PI_COMMAND"
+  PI_COMMAND="$(node -p 'require("node:fs").realpathSync(process.argv[1])' "$PI_COMMAND")"
+fi
+AGENT_DIR="$(node -p 'require("node:path").resolve(process.argv[1])' "$AGENT_DIR")"
+if [[ "$AGENT_DIR" == / ]]; then
+  printf 'Refusing to use the root agent directory.\n' >&2
+  exit 1
 fi
 
 # Validate the selected profile and print a plan before any package/configuration work.
@@ -129,16 +137,30 @@ fi
 if [[ "$UNINSTALL" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
   # Capture settings/package ownership before pi can update settings.json.
   node "$ROOT_DIR/install-config.js" --apply --quiet --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "${REQUESTED_PROVIDER:-openai-codex}"
-  run env PI_CODING_AGENT_DIR="$AGENT_DIR" pi install npm:pi-subagents
+fi
+
+if [[ "$UNINSTALL" -eq 0 ]]; then
+  PACKAGE_SOURCES="$(node "$ROOT_DIR/install-config.js" --package-sources --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "${REQUESTED_PROVIDER:-openai-codex}")"
+  while IFS= read -r source; do
+    [[ -n "$source" ]] || continue
+    # Ignore project settings during package installation; only the chosen global
+    # agent directory should be affected, regardless of the caller's directory.
+    run env PI_CODING_AGENT_DIR="$AGENT_DIR" "$PI_COMMAND" install "$source" --no-approve || {
+      package_status=$?
+      node "$ROOT_DIR/install-config.js" --restore-package-filters --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "${REQUESTED_PROVIDER:-openai-codex}"
+      exit "$package_status"
+    }
+  done <<< "$PACKAGE_SOURCES"
+  if (( ! DRY_RUN )); then
+    node "$ROOT_DIR/install-config.js" --restore-package-filters --agent-dir "$AGENT_DIR" --config-dir "$CONFIG_DIR" --provider "${REQUESTED_PROVIDER:-openai-codex}"
+  fi
 fi
 
 if (( DRY_RUN )); then
-  if [[ "$UNINSTALL" -eq 0 ]]; then
-    printf '+ env PI_CODING_AGENT_DIR=%q pi install npm:pi-subagents\n' "$AGENT_DIR"
-  fi
   printf 'Dry run: no files will be changed.\n'
   if [[ "$UNINSTALL" -eq 0 ]]; then
     printf '+ write %s\n' "$SETTINGS"
+    printf '+ merge %s/extensions/subagent/config.json\n' "$AGENT_DIR"
     printf '+ replace %s\n' "$INSTALL_DIR"
     printf '+ update %s between managed markers\n' "$AGENTS_FILE"
   else
